@@ -1,0 +1,178 @@
+import tkinter as tk
+from tkinter import simpledialog, filedialog, messagebox
+from PIL import Image, ImageTk
+import cv2
+import face_recognition
+import os
+import sqlite3
+
+class App:
+    def __init__(self, window, window_title, video_source=0):
+        self.window = window
+        self.window.title(window_title)
+        self.video_source = video_source
+
+        # Open video source
+        self.vid = cv2.VideoCapture(video_source)
+
+        # Create a canvas that can fit the above video source size
+        self.canvas = tk.Canvas(window, width=self.vid.get(cv2.CAP_PROP_FRAME_WIDTH), height=self.vid.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.canvas.pack()
+
+        # Button to quit the application
+        self.btn_quit = tk.Button(window, text="Quit", command=self.window.destroy)
+        self.btn_quit.pack(side=tk.LEFT)
+
+        # Button to add a new face
+        self.btn_add_face = tk.Button(window, text="Add Face", command=self.add_face)
+        self.btn_add_face.pack(side=tk.LEFT)
+
+        # Button to search by image
+        self.btn_search_by_image = tk.Button(window, text="Search by Image", command=self.search_by_image)
+        self.btn_search_by_image.pack(side=tk.LEFT)
+
+        # Database connection
+        self.conn = sqlite3.connect('face_recognition.db')
+        self.cursor = self.conn.cursor()
+        self.create_table()
+
+        # Load known faces
+        self.known_face_encodings, self.known_face_names, self.known_face_paths = self.load_known_faces()
+
+        # Update & display frames in the tkinter window
+        self.delay = 15
+        self.update()
+
+        self.window.mainloop()
+
+    def create_table(self):
+        try:
+            # Create table to store face names and image paths
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS faces (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    image_path TEXT NOT NULL
+                )
+            ''')
+            self.conn.commit()
+        except sqlite3.Error as e:
+            print(f"An error occurred when creating the table: {e}")
+
+    def load_known_faces(self):
+        known_face_encodings = []
+        known_face_names = []
+        known_face_paths = []
+        try:
+            # Load faces from the database
+            self.cursor.execute('SELECT name, image_path FROM faces')
+            faces = self.cursor.fetchall()
+            for name, image_path in faces:
+                image = face_recognition.load_image_file(image_path)
+                face_encoding = face_recognition.face_encodings(image)[0]
+                known_face_encodings.append(face_encoding)
+                known_face_names.append(name)
+                known_face_paths.append(image_path)
+        except sqlite3.Error as e:
+            print(f"An error occurred when loading faces: {e}")
+        return known_face_encodings, known_face_names, known_face_paths
+
+    def add_face(self):
+        name = simpledialog.askstring("Input", "What is the person's name?", parent=self.window)
+        if name:
+            ret, frame = self.vid.read()
+            if ret:
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                face_locations = face_recognition.face_locations(rgb_frame)
+                if face_locations:
+                    top, right, bottom, left = face_locations[0]
+                    face_image = rgb_frame[top:bottom, left:right]
+                    pil_image = Image.fromarray(face_image)
+                    image_path = f'C:\\Users\\ASUS\\captured_images\\{name}.png'
+                    pil_image.save(image_path)
+                    self.cursor.execute('INSERT INTO faces (name, image_path) VALUES (?, ?)', (name, image_path))
+                    self.conn.commit()
+                    self.known_face_encodings, self.known_face_names, self.known_face_paths = self.load_known_faces()
+
+    def search_by_image(self):
+        file_path = filedialog.askopenfilename()
+        if file_path:
+            image_to_search = face_recognition.load_image_file(file_path)
+            face_locations = face_recognition.face_locations(image_to_search)
+            if face_locations:
+                face_encoding = face_recognition.face_encodings(image_to_search, face_locations)[0]
+                matches = face_recognition.compare_faces(self.known_face_encodings, face_encoding)
+                if any(matches):
+                    first_match_index = matches.index(True)
+                    matched_name = self.known_face_names[first_match_index]
+                    matched_image_path = self.known_face_paths[first_match_index]
+
+                    # Display results
+                    top_window = tk.Toplevel(self.window)
+                    top_window.title("Search Results")
+                    label = tk.Label(top_window, text=f"Name: {matched_name}\nMatched Image Path: {matched_image_path}")
+                    label.pack()
+
+                    # Show new image
+                    new_image = Image.open(file_path)
+                    new_photo = ImageTk.PhotoImage(new_image)
+                    new_photo_label = tk.Label(top_window, image=new_photo)
+                    new_photo_label.image = new_photo
+                    new_photo_label.pack()
+
+                    # Show matched image
+                    matched_image = Image.open(matched_image_path)
+                    matched_photo = ImageTk.PhotoImage(matched_image)
+                    matched_photo_label = tk.Label(top_window, image=matched_photo)
+                    matched_photo_label.image = matched_photo
+                    matched_photo_label.pack()
+
+                else:
+                    messagebox.showinfo("Search by Image", "No matching face found.")
+            else:
+                messagebox.showinfo("Search by Image", "No faces found in the uploaded image.")
+        self.window.after(self.delay, self.update)
+
+    def update(self):
+        ret, frame = self.vid.read()
+        if ret:
+            # Convert image to RGB (Tkinter expects RGB images)
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    
+            # Detect faces and get their encodings
+            face_locations = face_recognition.face_locations(rgb_frame)
+            face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
+    
+            # Process each face found
+            for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
+                matches = face_recognition.compare_faces(self.known_face_encodings, face_encoding)
+                name = "Unknown"
+                if True in matches:
+                    first_match_index = matches.index(True)
+                    name = self.known_face_names[first_match_index]
+    
+                # Apply the grayscale filter to the face region
+                apply_gray_filter_to_face(rgb_frame, top, right, bottom, left)
+    
+                # Draw a rectangle and name tag around the face
+                cv2.rectangle(rgb_frame, (left, top), (right, bottom), (0, 0, 255), 2)
+                cv2.rectangle(rgb_frame, (left, bottom - 35), (right, bottom), (0, 0, 255), cv2.FILLED)
+                font = cv2.FONT_HERSHEY_DUPLEX
+                cv2.putText(rgb_frame, name, (left + 6, bottom - 6), font, 0.5, (255, 255, 255), 1)
+    
+            # Convert the modified frame to a Tkinter-compatible image
+            self.photo = ImageTk.PhotoImage(image=Image.fromarray(rgb_frame))
+            # Update the canvas item
+            self.canvas.create_image(0, 0, image=self.photo, anchor=tk.NW)
+    
+        # Schedule the next update
+        self.window.after(self.delay, self.update)
+
+
+    def __del__(self):
+        if self.vid.isOpened():
+            self.vid.release()
+        self.conn.close()
+
+root = tk.Tk()
+app = App(root, "Tkinter and OpenCV")
