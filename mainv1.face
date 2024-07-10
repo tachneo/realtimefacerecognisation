@@ -48,6 +48,7 @@ class ObjectRecognitionApp:
         self.current_frame = None
         self.known_faces = self.load_known_faces()
         self.known_objects = self.load_known_objects()
+        self.focused_object = None
 
         # Camera stream URL
         self.camera_url = "http://192.168.1.6:8080/video"
@@ -60,23 +61,28 @@ class ObjectRecognitionApp:
         self.thread.start()
 
     def create_widgets(self):
-        self.title_label = tk.Label(self.master, text="Object Recognition System", bg='#4A7A8C', fg='white', font=('Helvetica', 16, 'bold'))
-        self.title_label.pack(pady=10)
-
-        self.start_button = tk.Button(self.master, text="Start Camera", command=self.start_camera, bg='#5C8D99', fg='white', font=('Helvetica', 12, 'bold'))
-        self.start_button.pack(pady=5)
-
-        self.stop_button = tk.Button(self.master, text="Stop Camera", command=self.stop_camera, bg='#5C8D99', fg='white', font=('Helvetica', 12, 'bold'))
-        self.stop_button.pack(pady=5)
-
-        self.capture_button = tk.Button(self.master, text="Capture & Add Object", command=self.capture_and_add_object, bg='#5C8D99', fg='white', font=('Helvetica', 12, 'bold'))
-        self.capture_button.pack(pady=5)
-
-        self.entry_button = tk.Button(self.master, text="Enter New Object Manually", command=self.enter_object_manually, bg='#5C8D99', fg='white', font=('Helvetica', 12, 'bold'))
-        self.entry_button.pack(pady=5)
-
         self.canvas = tk.Canvas(self.master, width=800, height=600, bg='#B4D7E1')
         self.canvas.pack(pady=10)
+
+        self.footer_frame = tk.Frame(self.master, bg='#4A7A8C')
+        self.footer_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=10)
+
+        self.start_button = tk.Button(self.footer_frame, text="Start Camera", command=self.start_camera, bg='#5C8D99', fg='white', font=('Helvetica', 12, 'bold'))
+        self.start_button.pack(side=tk.LEFT, padx=5)
+
+        self.stop_button = tk.Button(self.footer_frame, text="Stop Camera", command=self.stop_camera, bg='#5C8D99', fg='white', font=('Helvetica', 12, 'bold'))
+        self.stop_button.pack(side=tk.LEFT, padx=5)
+
+        self.capture_button = tk.Button(self.footer_frame, text="Capture & Add Object", command=self.capture_and_add_object, bg='#5C8D99', fg='white', font=('Helvetica', 12, 'bold'))
+        self.capture_button.pack(side=tk.LEFT, padx=5)
+
+        self.focus_button = tk.Button(self.footer_frame, text="Focus Object", command=self.focus_object, bg='#5C8D99', fg='white', font=('Helvetica', 12, 'bold'))
+        self.focus_button.pack(side=tk.LEFT, padx=5)
+
+        self.entry_button = tk.Button(self.footer_frame, text="Enter New Object Manually", command=self.enter_object_manually, bg='#5C8D99', fg='white', font=('Helvetica', 12, 'bold'))
+        self.entry_button.pack(side=tk.LEFT, padx=5)
+
+        self.canvas.bind("<Button-1>", self.on_canvas_click)
 
     def load_known_faces(self):
         known_faces = {}
@@ -146,6 +152,41 @@ class ObjectRecognitionApp:
         label = f"Class {predicted_class}"
         cv2.putText(frame, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
 
+        # Now, match the frame against known faces
+        face_locations = face_recognition.face_locations(frame)
+        face_encodings = face_recognition.face_encodings(frame, face_locations)
+
+        for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
+            matches = face_recognition.compare_faces(list(self.known_faces.values()), face_encoding)
+            name = "Unknown"
+
+            if True in matches:
+                first_match_index = matches.index(True)
+                name = list(self.known_faces.keys())[first_match_index]
+                color = (0, 255, 0)  # Green for known faces
+            else:
+                color = (0, 0, 255)  # Red for unknown faces
+
+            # Draw a circle around the face
+            center = (left + (right - left) // 2, top + (bottom - top) // 2)
+            radius = max(right - left, bottom - top) // 2
+            cv2.circle(frame, center, radius, color, 2)
+            cv2.putText(frame, name, (left + 6, bottom - 6), cv2.FONT_HERSHEY_DUPLEX, 1.0, color, 1)
+
+    def on_canvas_click(self, event):
+        self.focused_object = (event.x, event.y)
+
+    def focus_object(self):
+        if self.focused_object and self.current_frame is not None:
+            x, y = self.focused_object
+            radius = 50  # Radius for the focus circle
+            cv2.circle(self.current_frame, (x, y), radius, (255, 255, 0), 2)
+            img = cv2.cvtColor(self.current_frame, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(img)
+            img_tk = ImageTk.PhotoImage(image=img)
+            self.canvas.create_image(0, 0, anchor=tk.NW, image=img_tk)
+            self.canvas.image = img_tk
+
     def save_unknown_image(self, frame, encoding=None):
         unknown_count = len(os.listdir("identified_images")) + 1
         filename = f"identified_images/unknown_{unknown_count}.jpg"
@@ -192,7 +233,8 @@ class ObjectRecognitionApp:
 
             # Save the image to train_images directory
             new_image_path = os.path.join("train_images", os.path.basename(image_path))
-            shutil.copy(image_path, new_image_path)
+            if image_path != new_image_path:
+                shutil.copy(image_path, new_image_path)
 
             conn = sqlite3.connect('object_recognition.db')
             c = conn.cursor()
@@ -248,7 +290,8 @@ class ObjectRecognitionApp:
 
             # Save the image to train_images directory
             new_image_path = os.path.join("train_images", os.path.basename(image_path))
-            shutil.copy(image_path, new_image_path)
+            if image_path != new_image_path:
+                shutil.copy(image_path, new_image_path)
 
             conn = sqlite3.connect('object_recognition.db')
             c = conn.cursor()
