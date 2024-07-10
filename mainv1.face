@@ -1,156 +1,274 @@
-import tkinter as tk
-from tkinter import simpledialog
-from PIL import Image, ImageTk
+import os
+import shutil
 import cv2
 import face_recognition
-import os
 import sqlite3
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from PIL import Image, ImageTk
 import numpy as np
+import tensorflow as tf
+import tensorflow_hub as hub
+import threading
 
-def apply_gray_filter_to_face(image, top, right, bottom, left):
-    """Apply a grayscale filter to the face area defined by the top, right, bottom, left coordinates."""
-    face_region = image[top:bottom, left:right]
-    grayscale_face = cv2.cvtColor(face_region, cv2.COLOR_BGR2GRAY)
-    grayscale_face_colored = cv2.cvtColor(grayscale_face, cv2.COLOR_GRAY2BGR)
-    image[top:bottom, left:right] = grayscale_face_colored
-    return image
+# Ensure the necessary directories exist
+os.makedirs("train_images", exist_ok=True)
+os.makedirs("identified_images", exist_ok=True)
 
-class App:
-    def __init__(self, window, window_title, video_source=0):
-        self.window = window
-        self.window.title(window_title)
-        self.video_source = video_source
+# Database setup
+def init_db():
+    conn = sqlite3.connect('object_recognition.db')
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS objects (
+            id INTEGER PRIMARY KEY,
+            name TEXT,
+            category TEXT,
+            image_path TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
 
-        # Open video source
-        self.vid = cv2.VideoCapture(video_source)
+# Load the MobileNetV2 model from TensorFlow Hub
+model = tf.keras.Sequential([
+    hub.KerasLayer("https://tfhub.dev/google/tf2-preview/mobilenet_v2/classification/4",
+                   trainable=True, arguments=dict(batch_norm_momentum=0.997))
+])
+model.build([None, 224, 224, 3])  # Batch input shape.
 
-        # Create a canvas that can fit the above video source size
-        self.canvas = tk.Canvas(window, width=self.vid.get(cv2.CAP_PROP_FRAME_WIDTH), height=self.vid.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.canvas.pack()
+# GUI application
+class ObjectRecognitionApp:
+    def __init__(self, master):
+        self.master = master
+        self.master.title("Object Recognition System")
+        self.master.configure(bg='#4A7A8C')
 
-        # Button to quit the application
-        self.btn_quit = tk.Button(window, text="Quit", command=self.window.destroy)
-        self.btn_quit.pack(side=tk.LEFT)
+        self.capture = None
+        self.current_frame = None
+        self.known_faces = self.load_known_faces()
+        self.known_objects = self.load_known_objects()
 
-        # Button to add a new face
-        self.btn_add_face = tk.Button(window, text="Add Face", command=self.add_face)
-        self.btn_add_face.pack(side=tk.LEFT)
+        # Camera stream URL
+        self.camera_url = "http://192.168.1.6:8080/video"
 
-        # Database connection
-        self.conn = sqlite3.connect('face_recognition.db')
-        self.cursor = self.conn.cursor()
-        self.create_table()
+        self.create_widgets()
 
-        # Load known faces
-        self.known_face_encodings, self.known_face_names = self.load_known_faces()
+        # Thread for capturing frames
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self.update_frame, args=())
+        self.thread.start()
 
-        # Update & display frames in the tkinter window
-        self.delay = 15
-        self.update()
+    def create_widgets(self):
+        self.title_label = tk.Label(self.master, text="Object Recognition System", bg='#4A7A8C', fg='white', font=('Helvetica', 16, 'bold'))
+        self.title_label.pack(pady=10)
 
-        self.window.mainloop()
+        self.start_button = tk.Button(self.master, text="Start Camera", command=self.start_camera, bg='#5C8D99', fg='white', font=('Helvetica', 12, 'bold'))
+        self.start_button.pack(pady=5)
 
-    def update(self):
-        ret, frame = self.vid.read()
-        if ret:
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            face_locations = face_recognition.face_locations(rgb_frame)
-            face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
+        self.stop_button = tk.Button(self.master, text="Stop Camera", command=self.stop_camera, bg='#5C8D99', fg='white', font=('Helvetica', 12, 'bold'))
+        self.stop_button.pack(pady=5)
 
-            for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
-                matches = face_recognition.compare_faces(self.known_face_encodings, face_encoding)
-                name = "Unknown"
+        self.capture_button = tk.Button(self.master, text="Capture & Add Object", command=self.capture_and_add_object, bg='#5C8D99', fg='white', font=('Helvetica', 12, 'bold'))
+        self.capture_button.pack(pady=5)
 
-                if True in matches:
-                    first_match_index = matches.index(True)
-                    name = self.known_face_names[first_match_index]
+        self.entry_button = tk.Button(self.master, text="Enter New Object Manually", command=self.enter_object_manually, bg='#5C8D99', fg='white', font=('Helvetica', 12, 'bold'))
+        self.entry_button.pack(pady=5)
 
-                # Apply the grayscale filter to the face region
-                frame = apply_gray_filter_to_face(frame, top, right, bottom, left)
-
-                # Draw a rectangle around the face and put the name
-                cv2.rectangle(frame, (left, top), (right, bottom), (0, 0, 255), 2)
-                cv2.rectangle(frame, (left, bottom - 35), (right, bottom), (0, 0, 255), cv2.FILLED)
-                font = cv2.FONT_HERSHEY_DUPLEX
-                cv2.putText(frame, name, (left + 6, bottom - 6), font, 0.5, (255, 255, 255), 1)
-
-            self.photo = ImageTk.PhotoImage(image=Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
-            self.canvas.create_image(0, 0, image=self.photo, anchor=tk.NW)
-
-        self.window.after(self.delay, self.update)    
-
-    def create_table(self):
-        try:
-            # Create table to store face names and image paths
-            self.cursor.execute('''
-                CREATE TABLE IF NOT EXISTS faces (
-                    id INTEGER PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    image_path TEXT NOT NULL
-                )
-            ''')
-            self.conn.commit()
-            print("Table created successfully.")
-        except sqlite3.Error as e:
-            print(f"An error occurred when creating the table: {e}")
+        self.canvas = tk.Canvas(self.master, width=800, height=600, bg='#B4D7E1')
+        self.canvas.pack(pady=10)
 
     def load_known_faces(self):
-        known_face_encodings = []
-        known_face_names = []
-        try:
-            # Load faces from the database
-            self.cursor.execute('SELECT name, image_path FROM faces')
-            faces = self.cursor.fetchall()
-            for name, image_path in faces:
+        known_faces = {}
+        for filename in os.listdir("train_images"):
+            if filename.endswith(".jpg") or filename.endswith(".png"):
+                image_path = os.path.join("train_images", filename)
                 image = face_recognition.load_image_file(image_path)
-                face_encoding = face_recognition.face_encodings(image)[0]
-                known_face_encodings.append(face_encoding)
-                known_face_names.append(name)
-        except sqlite3.Error as e:
-            print(f"An error occurred when loading faces: {e}")
-        return known_face_encodings, known_face_names
+                encodings = face_recognition.face_encodings(image)
+                if encodings:
+                    encoding = encodings[0]
+                    label = os.path.splitext(filename)[0]
+                    known_faces[label] = encoding
+        return known_faces
 
-    def add_face(self):
-        name = simpledialog.askstring("Input", "What is the person's name?", parent=self.window)
-        if name:
-            ret, frame = self.vid.read()
-            if ret:
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                face_locations = face_recognition.face_locations(rgb_frame)
-                if face_locations:
-                    top, right, bottom, left = face_locations[0]
-                    face_image = rgb_frame[top:bottom, left:right]
-                    pil_image = Image.fromarray(face_image)
-                    image_path = f'C:\\Users\\ASUS\\captured_images\\{name}.png'
-                    pil_image.save(image_path)
-                    self.cursor.execute('INSERT INTO faces (name, image_path) VALUES (?, ?)', (name, image_path))
-                    self.conn.commit()
-                    self.known_face_encodings, self.known_face_names = self.load_known_faces()
+    def load_known_objects(self):
+        known_objects = {}
+        conn = sqlite3.connect('object_recognition.db')
+        c = conn.cursor()
+        for row in c.execute("SELECT name, category, image_path FROM objects"):
+            name, category, image_path = row
+            known_objects[name] = {
+                'category': category,
+                'image': cv2.imread(image_path)
+            }
+        conn.close()
+        return known_objects
 
-    def update(self):
-        ret, frame = self.vid.read()
-        if ret:
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            face_locations = face_recognition.face_locations(rgb_frame)
-            face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
-            for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
-                matches = face_recognition.compare_faces(self.known_face_encodings, face_encoding)
-                name = "Unknown"
-                if True in matches:
-                    first_match_index = matches.index(True)
-                    name = self.known_face_names[first_match_index]
-                cv2.rectangle(frame, (left, top), (right, bottom), (0, 0, 255), 2)
-                cv2.rectangle(frame, (left, bottom - 35), (right, bottom), (0, 0, 255), cv2.FILLED)
-                font = cv2.FONT_HERSHEY_DUPLEX
-                cv2.putText(frame, name, (left + 6, bottom - 6), font, 0.5, (255, 255, 255), 1)
-            self.photo = ImageTk.PhotoImage(image=Image.fromarray(frame))
-            self.canvas.create_image(0, 0, image=self.photo, anchor=tk.NW)
-        self.window.after(self.delay, self.update)
+    def start_camera(self):
+        self.capture = cv2.VideoCapture(self.camera_url)
+        self.stop_event.clear()
 
-    def __del__(self):
-        if self.vid.isOpened():
-            self.vid.release()
-        self.conn.close()
+    def stop_camera(self):
+        if self.capture:
+            self.capture.release()
+            self.capture = None
+        self.stop_event.set()
 
-root = tk.Tk()
-app = App(root, "Tkinter and OpenCV")
+    def update_frame(self):
+        while not self.stop_event.is_set():
+            if self.capture:
+                ret, frame = self.capture.read()
+                if ret:
+                    self.current_frame = frame
+                    # Resize frame to increase view area
+                    frame = cv2.resize(frame, (800, 600))
+                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    small_frame = cv2.resize(rgb_frame, (224, 224)) / 255.0
+
+                    # Run the MobileNetV2 model
+                    predictions = model.predict(np.expand_dims(small_frame, axis=0))
+                    predicted_class = np.argmax(predictions[0])
+
+                    # Add object detection boxes and labels
+                    self.draw_boxes(frame, predicted_class)
+
+                    img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    img = Image.fromarray(img)
+                    img_tk = ImageTk.PhotoImage(image=img)
+                    self.canvas.create_image(0, 0, anchor=tk.NW, image=img_tk)
+                    self.canvas.image = img_tk
+            else:
+                self.stop_event.wait(1)
+
+    def draw_boxes(self, frame, predicted_class):
+        # Assuming predicted_class is an index, you need to map it to the actual label
+        # Here we just print the class index. You should replace this with the actual label.
+        label = f"Class {predicted_class}"
+        cv2.putText(frame, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+
+    def save_unknown_image(self, frame, encoding=None):
+        unknown_count = len(os.listdir("identified_images")) + 1
+        filename = f"identified_images/unknown_{unknown_count}.jpg"
+        cv2.imwrite(filename, frame)
+
+        if encoding is not None:
+            self.enter_object(encoding)
+
+    def capture_and_add_object(self):
+        if self.current_frame is not None:
+            filename = filedialog.asksaveasfilename(defaultextension=".jpg", filetypes=[("JPEG files", "*.jpg"), ("All files", "*.*")])
+            if filename:
+                cv2.imwrite(filename, self.current_frame)
+                self.enter_object_manually(filename)
+
+    def enter_object(self, encoding=None):
+        new_window = tk.Toplevel(self.master)
+        new_window.title("Enter New Object")
+
+        tk.Label(new_window, text="Object Name").grid(row=0)
+        tk.Label(new_window, text="Category").grid(row=1)
+        tk.Label(new_window, text="Image").grid(row=2)
+
+        name_entry = tk.Entry(new_window)
+        category_entry = tk.Entry(new_window)
+        image_entry = tk.Entry(new_window)
+
+        name_entry.grid(row=0, column=1)
+        category_entry.grid(row=1, column=1)
+        image_entry.grid(row=2, column=1)
+
+        def select_image():
+            file_path = filedialog.askopenfilename()
+            image_entry.delete(0, tk.END)
+            image_entry.insert(0, file_path)
+
+        select_image_button = tk.Button(new_window, text="Browse", command=select_image)
+        select_image_button.grid(row=2, column=2)
+
+        def save_object():
+            name = name_entry.get()
+            category = category_entry.get()
+            image_path = image_entry.get()
+
+            # Save the image to train_images directory
+            new_image_path = os.path.join("train_images", os.path.basename(image_path))
+            shutil.copy(image_path, new_image_path)
+
+            conn = sqlite3.connect('object_recognition.db')
+            c = conn.cursor()
+            c.execute("INSERT INTO objects (name, category, image_path) VALUES (?, ?, ?)", (name, category, new_image_path))
+            conn.commit()
+            conn.close()
+
+            if encoding is not None:
+                self.known_faces[name] = encoding
+
+            self.known_objects[name] = {
+                'category': category,
+                'image': cv2.imread(new_image_path)
+            }
+
+            messagebox.showinfo("Success", "Object entry saved successfully!")
+            new_window.destroy()
+
+        save_button = tk.Button(new_window, text="Save", command=save_object)
+        save_button.grid(row=3, columnspan=3)
+
+    def enter_object_manually(self, image_path=None):
+        new_window = tk.Toplevel(self.master)
+        new_window.title("Enter New Object")
+
+        tk.Label(new_window, text="Object Name").grid(row=0)
+        tk.Label(new_window, text="Category").grid(row=1)
+        tk.Label(new_window, text="Image").grid(row=2)
+
+        name_entry = tk.Entry(new_window)
+        category_entry = tk.Entry(new_window)
+        image_entry = tk.Entry(new_window)
+
+        name_entry.grid(row=0, column=1)
+        category_entry.grid(row=1, column=1)
+        image_entry.grid(row=2, column=1)
+
+        if image_path:
+            image_entry.insert(0, image_path)
+
+        def select_image():
+            file_path = filedialog.askopenfilename()
+            image_entry.delete(0, tk.END)
+            image_entry.insert(0, file_path)
+
+        select_image_button = tk.Button(new_window, text="Browse", command=select_image)
+        select_image_button.grid(row=2, column=2)
+
+        def save_object():
+            name = name_entry.get()
+            category = category_entry.get()
+            image_path = image_entry.get()
+
+            # Save the image to train_images directory
+            new_image_path = os.path.join("train_images", os.path.basename(image_path))
+            shutil.copy(image_path, new_image_path)
+
+            conn = sqlite3.connect('object_recognition.db')
+            c = conn.cursor()
+            c.execute("INSERT INTO objects (name, category, image_path) VALUES (?, ?, ?)", (name, category, new_image_path))
+            conn.commit()
+            conn.close()
+
+            self.known_objects[name] = {
+                'category': category,
+                'image': cv2.imread(new_image_path)
+            }
+
+            messagebox.showinfo("Success", "Object entry saved successfully!")
+            new_window.destroy()
+
+        save_button = tk.Button(new_window, text="Save", command=save_object)
+        save_button.grid(row=3, columnspan=3)
+
+if __name__ == "__main__":
+    init_db()
+    root = tk.Tk()
+    app = ObjectRecognitionApp(root)
+    root.mainloop()
