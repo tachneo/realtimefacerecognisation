@@ -1,317 +1,465 @@
-import os
-import shutil
-import cv2
-import face_recognition
-import sqlite3
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import messagebox, filedialog, simpledialog
+import cv2
 from PIL import Image, ImageTk
-import numpy as np
-import tensorflow as tf
-import tensorflow_hub as hub
+import torch
 import threading
+import queue
+import sqlite3
+import os
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import joblib
+import pytesseract
+import csv
 
-# Ensure the necessary directories exist
-os.makedirs("train_images", exist_ok=True)
-os.makedirs("identified_images", exist_ok=True)
+# Ensure the trained_images directory exists
+os.makedirs("trained_images", exist_ok=True)
+os.makedirs("dataset", exist_ok=True)
 
-# Database setup
-def init_db():
-    conn = sqlite3.connect('object_recognition.db')
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS objects (
-            id INTEGER PRIMARY KEY,
-            name TEXT,
-            category TEXT,
-            image_path TEXT
-        )
-    ''')
-    conn.commit()
-    conn.close()
+# Load YOLOv5 model
+model_options = {
+    "YOLOv5s": "yolov5s",
+    "YOLOv5m": "yolov5m",
+    "YOLOv5l": "yolov5l",
+    "YOLOv5x": "yolov5x"
+}
 
-# Load the MobileNetV2 model from TensorFlow Hub
-model = tf.keras.Sequential([
-    hub.KerasLayer("https://tfhub.dev/google/tf2-preview/mobilenet_v2/classification/4",
-                   trainable=True, arguments=dict(batch_norm_momentum=0.997))
-])
-model.build([None, 224, 224, 3])  # Batch input shape.
+# Initialize database
+conn = sqlite3.connect('recognition_data.db')
+cursor = conn.cursor()
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS recognitions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    category TEXT,
+    name TEXT,
+    datetime TEXT,
+    image_path TEXT,
+    model_number TEXT,
+    remarks TEXT
+)
+''')
+conn.commit()
 
-# GUI application
-class ObjectRecognitionApp:
-    def __init__(self, master):
-        self.master = master
-        self.master.title("Object Recognition System")
-        self.master.configure(bg='#4A7A8C')
+class MobileCameraApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Mobile Camera App")
+        self.root.geometry("1200x700")
+        self.root.configure(bg='#2c3e50')
+        
+        self.sidebar_frame = tk.Frame(root, bg='#2c3e50', width=200)
+        self.sidebar_frame.pack(side='left', fill='y')
+        
+        self.main_frame = tk.Frame(root, bg='#34495e')
+        self.main_frame.pack(side='right', expand=True, fill='both')
 
-        self.capture = None
-        self.current_frame = None
-        self.known_faces = self.load_known_faces()
-        self.known_objects = self.load_known_objects()
-        self.focused_object = None
+        self.timer_label = tk.Label(self.sidebar_frame, text="", font=("Helvetica", 10), bg='#2c3e50', fg='white')
+        self.timer_label.pack(padx=10, pady=5)
 
-        # Camera stream URL
-        self.camera_url = "http://192.168.1.6:8080/video"
+        self.camera_frame = tk.Label(self.main_frame, bg='#34495e')
+        self.camera_frame.pack(padx=20, pady=20, expand=True, fill='both')
+        
+        self.control_frame = tk.Frame(self.main_frame, bg='#2c3e50')
+        self.control_frame.pack(side='bottom', pady=10)
 
-        self.create_widgets()
+        self.start_button = tk.Button(self.control_frame, text="Start Camera", command=self.start_camera, bg='#27ae60', fg='white', font=("Helvetica", 10))
+        self.start_button.grid(row=0, column=0, padx=5, pady=5)
+        
+        self.stop_button = tk.Button(self.control_frame, text="Stop Camera", command=self.stop_camera, bg='#e74c3c', fg='white', font=("Helvetica", 10))
+        self.stop_button.grid(row=0, column=1, padx=5, pady=5)
 
-        # Thread for capturing frames
-        self.stop_event = threading.Event()
-        self.thread = threading.Thread(target=self.update_frame, args=())
-        self.thread.start()
+        self.start_detection_button = tk.Button(self.control_frame, text="Start Detection", command=self.start_detection, bg='#3498db', fg='white', font=("Helvetica", 10))
+        self.start_detection_button.grid(row=0, column=2, padx=5, pady=5)
 
-    def create_widgets(self):
-        self.canvas = tk.Canvas(self.master, width=800, height=600, bg='#B4D7E1')
-        self.canvas.pack(pady=10)
+        self.stop_detection_button = tk.Button(self.control_frame, text="Stop Detection", command=self.stop_detection, bg='#e74c3c', fg='white', font=("Helvetica", 10))
+        self.stop_detection_button.grid(row=0, column=3, padx=5, pady=5)
+        
+        self.capture_button = tk.Button(self.control_frame, text="Capture & Tag", command=self.capture_image, bg='#3498db', fg='white', font=("Helvetica", 10))
+        self.capture_button.grid(row=0, column=4, padx=5, pady=5)
+        
+        self.train_button = tk.Button(self.control_frame, text="Train Model", command=self.train_model, bg='#e67e22', fg='white', font=("Helvetica", 10))
+        self.train_button.grid(row=0, column=5, padx=5, pady=5)
 
-        self.footer_frame = tk.Frame(self.master, bg='#4A7A8C')
-        self.footer_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=10)
+        self.switch_model_button = tk.Button(self.control_frame, text="Switch Model", command=self.switch_model, bg='#9b59b6', fg='white', font=("Helvetica", 10))
+        self.switch_model_button.grid(row=0, column=6, padx=5, pady=5)
 
-        self.start_button = tk.Button(self.footer_frame, text="Start Camera", command=self.start_camera, bg='#5C8D99', fg='white', font=('Helvetica', 12, 'bold'))
-        self.start_button.pack(side=tk.LEFT, padx=5)
+        self.night_vision_button = tk.Button(self.control_frame, text="Toggle Night Vision", command=self.toggle_night_vision, bg='#2c3e50', fg='white', font=("Helvetica", 10))
+        self.night_vision_button.grid(row=0, column=7, padx=5, pady=5)
 
-        self.stop_button = tk.Button(self.footer_frame, text="Stop Camera", command=self.stop_camera, bg='#5C8D99', fg='white', font=('Helvetica', 12, 'bold'))
-        self.stop_button.pack(side=tk.LEFT, padx=5)
+        self.ip_entry_label = tk.Label(self.control_frame, text="IP Address:", font=("Helvetica", 10), bg='#2c3e50', fg='white')
+        self.ip_entry_label.grid(row=0, column=8, padx=5, pady=5)
+        self.ip_entry = tk.Entry(self.control_frame, font=("Helvetica", 10))
+        self.ip_entry.grid(row=0, column=9, padx=5, pady=5)
+        self.ip_entry.insert(0, "192.168.1.2:8080")
 
-        self.capture_button = tk.Button(self.footer_frame, text="Capture & Add Object", command=self.capture_and_add_object, bg='#5C8D99', fg='white', font=('Helvetica', 12, 'bold'))
-        self.capture_button.pack(side=tk.LEFT, padx=5)
+        self.dashboard_button = tk.Button(self.sidebar_frame, text="Dashboard", command=self.show_dashboard, bg='#3498db', fg='white', font=("Helvetica", 12, "bold"))
+        self.dashboard_button.pack(fill='x', padx=10, pady=10)
+        
+        self.real_time_button = tk.Button(self.sidebar_frame, text="Real-time View", command=self.show_realtime_view, bg='#3498db', fg='white', font=("Helvetica", 12, "bold"))
+        self.real_time_button.pack(fill='x', padx=10, pady=10)
 
-        self.focus_button = tk.Button(self.footer_frame, text="Focus Object", command=self.focus_object, bg='#5C8D99', fg='white', font=('Helvetica', 12, 'bold'))
-        self.focus_button.pack(side=tk.LEFT, padx=5)
+        self.date_filter_label = tk.Label(self.sidebar_frame, text="Filter by Date Range:", font=("Helvetica", 12, "bold"), bg='#2c3e50', fg='white')
+        self.date_filter_label.pack(fill='x', padx=10, pady=5)
 
-        self.entry_button = tk.Button(self.footer_frame, text="Enter New Object Manually", command=self.enter_object_manually, bg='#5C8D99', fg='white', font=('Helvetica', 12, 'bold'))
-        self.entry_button.pack(side=tk.LEFT, padx=5)
+        self.start_date_entry = tk.Entry(self.sidebar_frame, font=("Helvetica", 12))
+        self.start_date_entry.pack(fill='x', padx=10, pady=5)
+        self.start_date_entry.insert(0, "Start Date (YYYY-MM-DD)")
 
-        self.canvas.bind("<Button-1>", self.on_canvas_click)
+        self.end_date_entry = tk.Entry(self.sidebar_frame, font=("Helvetica", 12))
+        self.end_date_entry.pack(fill='x', padx=10, pady=5)
+        self.end_date_entry.insert(0, "End Date (YYYY-MM-DD)")
 
-    def load_known_faces(self):
-        known_faces = {}
-        for filename in os.listdir("train_images"):
-            if filename.endswith(".jpg") or filename.endswith(".png"):
-                image_path = os.path.join("train_images", filename)
-                image = face_recognition.load_image_file(image_path)
-                encodings = face_recognition.face_encodings(image)
-                if encodings:
-                    encoding = encodings[0]
-                    label = os.path.splitext(filename)[0]
-                    known_faces[label] = encoding
-        return known_faces
+        self.filter_button = tk.Button(self.sidebar_frame, text="Apply Filter", command=self.apply_filter, bg='#27ae60', fg='white', font=("Helvetica", 12, "bold"))
+        self.filter_button.pack(fill='x', padx=10, pady=10)
+        
+        self.export_button = tk.Button(self.sidebar_frame, text="Export Report", command=self.export_report, bg='#e67e22', fg='white', font=("Helvetica", 12, "bold"))
+        self.export_button.pack(fill='x', padx=10, pady=10)
+        
+        self.category_count_label = tk.Label(self.sidebar_frame, text="", font=("Helvetica", 12), bg='#2c3e50', fg='white')
+        self.category_count_label.pack(fill='x', padx=10, pady=10)
 
-    def load_known_objects(self):
-        known_objects = {}
-        conn = sqlite3.connect('object_recognition.db')
-        c = conn.cursor()
-        for row in c.execute("SELECT name, category, image_path FROM objects"):
-            name, category, image_path = row
-            known_objects[name] = {
-                'category': category,
-                'image': cv2.imread(image_path)
-            }
-        conn.close()
-        return known_objects
+        self.vid = None
+        self.running = False
+        self.detecting = False
+        self.night_vision = False
+        self.model = model_options["YOLOv5s"]
+        self.model_loaded = torch.hub.load('ultralytics/yolov5', self.model, pretrained=True)
+        self.camera_index = 0
+        
+        self.frame_queue = queue.Queue()
+        self.image_queue = queue.Queue()
+        
+        self.knn_classifier = None
+        self.load_classifier()
+
+        self.update_timer()
+        self.update_category_count()
+        self.root.after(10, self.update_gui_frame)
+
+    def load_classifier(self):
+        if os.path.exists('classifier.joblib'):
+            self.knn_classifier = joblib.load('classifier.joblib')
+        else:
+            self.knn_classifier = None
+
+    def save_classifier(self):
+        if self.knn_classifier is not None:
+            joblib.dump(self.knn_classifier, 'classifier.joblib')
+
+    def extract_features(self, img_path):
+        img = cv2.imread(img_path)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.resize(gray, (100, 100))
+        return gray.flatten()
 
     def start_camera(self):
-        self.capture = cv2.VideoCapture(self.camera_url)
-        self.stop_event.clear()
-
+        ip = self.ip_entry.get()
+        if self.camera_index == 0:
+            self.vid = cv2.VideoCapture(f"http://{ip}/video")
+        else:
+            self.vid = cv2.VideoCapture(f"http://{ip}/video2")
+        
+        if not self.vid.isOpened():
+            messagebox.showerror("Error", "Unable to access the camera. Please check the IP address.")
+            return
+        self.running = True
+        threading.Thread(target=self.update_frame, daemon=True).start()
+    
     def stop_camera(self):
-        if self.capture:
-            self.capture.release()
-            self.capture = None
-        self.stop_event.set()
+        self.running = False
+        if self.vid:
+            self.vid.release()
+            self.vid = None
+        self.camera_frame.config(image='')
+
+    def start_detection(self):
+        self.detecting = True
+        threading.Thread(target=self.process_frame, daemon=True).start()
+
+    def stop_detection(self):
+        self.detecting = False
+
+    def switch_camera(self):
+        self.camera_index = 1 - self.camera_index  # Toggle between 0 and 1
+        if self.running:
+            self.stop_camera()
+            self.start_camera()
+
+    def capture_image(self):
+        if self.vid and self.running:
+            ret, frame = self.vid.read()
+            if ret:
+                category = simpledialog.askstring("Input", "Enter category:")
+                name = simpledialog.askstring("Input", "Enter name:")
+                model_number = simpledialog.askstring("Input", "Enter model number:")
+                remarks = simpledialog.askstring("Input", "Enter remarks:")
+                if category and name:
+                    timestamp = time.strftime("%Y%m%d_%H%M%S")
+                    filename = f"trained_images/{category}_{name}_{timestamp}.jpg"
+                    cv2.imwrite(filename, frame)
+                    messagebox.showinfo("Image Capture", f"Image captured and saved as {filename}")
+                    cursor.execute("INSERT INTO recognitions (category, name, datetime, image_path, model_number, remarks) VALUES (?, ?, ?, ?, ?, ?)", (category, name, timestamp, filename, model_number, remarks))
+                    conn.commit()
+                    self.train_model()
+                else:
+                    messagebox.showerror("Error", "Category and name must be provided.")
+
+    def prepare_dataset(self):
+        images = []
+        labels = []
+        for root, dirs, files in os.walk("trained_images"):
+            for file in files:
+                if file.endswith(".jpg"):
+                    path = os.path.join(root, file)
+                    try:
+                        label = file.split('_')[1]  # Use the name as label
+                    except IndexError:
+                        continue  # Skip files that do not have the expected format
+                    features = self.extract_features(path)
+                    images.append(features)
+                    labels.append(label)
+        return np.array(images), np.array(labels)
+
+    def train_model(self):
+        images, labels = self.prepare_dataset()
+        if len(images) > 0:
+            self.knn_classifier = CustomKNNClassifier()
+            self.knn_classifier.fit(images, labels)
+            self.save_classifier()
+            messagebox.showinfo("Train Model", "Training completed!")
+        else:
+            messagebox.showinfo("Train Model", "No images to train.")
+
+    def switch_model(self):
+        model_name = simpledialog.askstring("Input", f"Enter model name ({', '.join(model_options.keys())}):")
+        if model_name in model_options:
+            self.model = model_options[model_name]
+            self.model_loaded = torch.hub.load('ultralytics/yolov5', self.model, pretrained=True)
+            messagebox.showinfo("Model Switch", f"Switched to {model_name}")
+        else:
+            messagebox.showerror("Error", "Invalid model name. Please enter a valid model name.")
+    
+    def toggle_night_vision(self):
+        self.night_vision = not self.night_vision
+        state = "enabled" if self.night_vision else "disabled"
+        messagebox.showinfo("Night Vision", f"Night vision {state}")
 
     def update_frame(self):
-        while not self.stop_event.is_set():
-            if self.capture:
-                ret, frame = self.capture.read()
-                if ret:
-                    self.current_frame = frame
-                    # Resize frame to increase view area
-                    frame = cv2.resize(frame, (800, 600))
-                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    small_frame = cv2.resize(rgb_frame, (224, 224)) / 255.0
+        while self.running and self.vid.isOpened():
+            ret, frame = self.vid.read()
+            if ret:
+                self.frame_queue.put(frame)
+            time.sleep(0.03)  # Slight delay to reduce CPU usage
+    
+    def process_frame(self):
+        while self.detecting:
+            if not self.frame_queue.empty():
+                frame = self.frame_queue.get()
+                # Apply night vision enhancement if enabled
+                if self.night_vision:
+                    frame = self.apply_night_vision(frame)
+                
+                # Reduce frame size for faster processing
+                frame_resized = cv2.resize(frame, (640, 480))
 
-                    # Run the MobileNetV2 model
-                    predictions = model.predict(np.expand_dims(small_frame, axis=0))
-                    predicted_class = np.argmax(predictions[0])
+                # Add date and time to the frame
+                timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                cv2.putText(frame_resized, timestamp, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
 
-                    # Add object detection boxes and labels
-                    self.draw_boxes(frame, predicted_class)
+                # Check if we have a trained classifier
+                if self.knn_classifier:
+                    gray_frame = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2GRAY)
+                    gray_frame = cv2.resize(gray_frame, (100, 100)).flatten().reshape(1, -1)
+                    prediction = self.knn_classifier.predict(gray_frame)
+                    label = prediction[0]
+                    conf = 1.0  # Confidence not calculated, assuming 100% for custom KNN
+                    x1, y1, x2, y2 = 50, 50, 200, 200  # Placeholder values, no bounding box info from KNN
+                    cv2.putText(frame_resized, f'{label} {conf:.2f}', (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                else:
+                    # Perform YOLO detection
+                    results = self.model_loaded(frame_resized)
+                    detections = results.pandas().xyxy[0]
+                    
+                    for _, row in detections.iterrows():
+                        x1, y1, x2, y2 = int(row['xmin']), int(row['ymin']), int(row['xmax']), int(row['ymax'])
+                        label = row['name']
+                        conf = row['confidence']
+                        cv2.putText(frame_resized, f'{label} {conf:.2f}', (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                
+                # Convert frame to ImageTk format
+                cv2image = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(cv2image)
+                imgtk = ImageTk.PhotoImage(image=img)
+                
+                # Put the image in the queue
+                self.image_queue.put(imgtk)
 
-                    img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    img = Image.fromarray(img)
-                    img_tk = ImageTk.PhotoImage(image=img)
-                    self.canvas.create_image(0, 0, anchor=tk.NW, image=img_tk)
-                    self.canvas.image = img_tk
-            else:
-                self.stop_event.wait(1)
+    def apply_night_vision(self, frame):
+        # Convert to grayscale
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # Apply histogram equalization
+        equalized_frame = cv2.equalizeHist(gray_frame)
+        # Convert back to BGR
+        night_vision_frame = cv2.cvtColor(equalized_frame, cv2.COLOR_GRAY2BGR)
+        return night_vision_frame
+    
+    def update_gui_frame(self):
+        if not self.image_queue.empty():
+            imgtk = self.image_queue.get()
+            self.camera_frame.imgtk = imgtk
+            self.camera_frame.config(image=imgtk)
+        self.root.after(10, self.update_gui_frame)
 
-    def draw_boxes(self, frame, predicted_class):
-        # Assuming predicted_class is an index, you need to map it to the actual label
-        # Here we just print the class index. You should replace this with the actual label.
-        label = f"Class {predicted_class}"
-        cv2.putText(frame, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+    def update_timer(self):
+        current_time = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.timer_label.config(text=current_time)
+        self.root.after(1000, self.update_timer)
 
-        # Now, match the frame against known faces
-        face_locations = face_recognition.face_locations(frame)
-        face_encodings = face_recognition.face_encodings(frame, face_locations)
+    def update_category_count(self):
+        cursor.execute("SELECT category, COUNT(*) FROM recognitions GROUP BY category")
+        data = cursor.fetchall()
+        counts = "\n".join([f"{row[0]}: {row[1]}" for row in data])
+        self.category_count_label.config(text=counts)
+        self.root.after(60000, self.update_category_count)  # Update every minute
 
-        for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
-            matches = face_recognition.compare_faces(list(self.known_faces.values()), face_encoding)
-            name = "Unknown"
+    def apply_filter(self):
+        start_date = self.start_date_entry.get()
+        end_date = self.end_date_entry.get()
 
-            if True in matches:
-                first_match_index = matches.index(True)
-                name = list(self.known_faces.keys())[first_match_index]
-                color = (0, 255, 0)  # Green for known faces
-            else:
-                color = (0, 0, 255)  # Red for unknown faces
+        for widget in self.main_frame.winfo_children():
+            widget.destroy()
+        
+        cursor.execute("SELECT category, COUNT(*) FROM recognitions WHERE datetime BETWEEN ? AND ? GROUP BY category", (start_date, end_date))
+        data = cursor.fetchall()
+        categories = [row[0] for row in data]
+        counts = [row[1] for row in data]
 
-            # Draw a circle around the face
-            center = (left + (right - left) // 2, top + (bottom - top) // 2)
-            radius = max(right - left, bottom - top) // 2
-            cv2.circle(frame, center, radius, color, 2)
-            cv2.putText(frame, name, (left + 6, bottom - 6), cv2.FONT_HERSHEY_DUPLEX, 1.0, color, 1)
+        fig, ax = plt.subplots()
+        ax.bar(categories, counts, color='blue')
+        ax.set_title('Recognitions by Category')
+        ax.set_xlabel('Category')
+        ax.set_ylabel('Count')
 
-    def on_canvas_click(self, event):
-        self.focused_object = (event.x, event.y)
+        canvas = FigureCanvasTkAgg(fig, master=self.main_frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(expand=True, fill='both')
 
-    def focus_object(self):
-        if self.focused_object and self.current_frame is not None:
-            x, y = self.focused_object
-            radius = 50  # Radius for the focus circle
-            cv2.circle(self.current_frame, (x, y), radius, (255, 255, 0), 2)
-            img = cv2.cvtColor(self.current_frame, cv2.COLOR_BGR2RGB)
-            img = Image.fromarray(img)
-            img_tk = ImageTk.PhotoImage(image=img)
-            self.canvas.create_image(0, 0, anchor=tk.NW, image=img_tk)
-            self.canvas.image = img_tk
+    def export_report(self):
+        cursor.execute("SELECT * FROM recognitions")
+        data = cursor.fetchall()
+        with open("recognition_report.csv", "w", newline="") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow([desc[0] for desc in cursor.description])  # write headers
+            writer.writerows(data)
+        messagebox.showinfo("Export Report", "Report exported as recognition_report.csv")
 
-    def save_unknown_image(self, frame, encoding=None):
-        unknown_count = len(os.listdir("identified_images")) + 1
-        filename = f"identified_images/unknown_{unknown_count}.jpg"
-        cv2.imwrite(filename, frame)
+    def show_dashboard(self):
+        for widget in self.main_frame.winfo_children():
+            widget.destroy()
+        
+        cursor.execute("SELECT category, COUNT(*) FROM recognitions GROUP BY category")
+        data = cursor.fetchall()
+        categories = [row[0] for row in data]
+        counts = [row[1] for row in data]
 
-        if encoding is not None:
-            self.enter_object(encoding)
+        fig, ax = plt.subplots()
+        ax.bar(categories, counts, color='blue')
+        ax.set_title('Recognitions by Category')
+        ax.set_xlabel('Category')
+        ax.set_ylabel('Count')
 
-    def capture_and_add_object(self):
-        if self.current_frame is not None:
-            filename = filedialog.asksaveasfilename(defaultextension=".jpg", filetypes=[("JPEG files", "*.jpg"), ("All files", "*.*")])
-            if filename:
-                cv2.imwrite(filename, self.current_frame)
-                self.enter_object_manually(filename)
+        canvas = FigureCanvasTkAgg(fig, master=self.main_frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(expand=True, fill='both')
 
-    def enter_object(self, encoding=None):
-        new_window = tk.Toplevel(self.master)
-        new_window.title("Enter New Object")
+        # Add three small charts to the dashboard
+        fig2, ax2 = plt.subplots()
+        ax2.pie(counts, labels=categories, autopct='%1.1f%%')
+        ax2.set_title('Category Distribution')
+        canvas2 = FigureCanvasTkAgg(fig2, master=self.main_frame)
+        canvas2.draw()
+        canvas2.get_tk_widget().pack(side='left', expand=True, fill='both', padx=10, pady=10)
 
-        tk.Label(new_window, text="Object Name").grid(row=0)
-        tk.Label(new_window, text="Category").grid(row=1)
-        tk.Label(new_window, text="Image").grid(row=2)
+        fig3, ax3 = plt.subplots()
+        ax3.plot(categories, counts, marker='o')
+        ax3.set_title('Trend Over Time')
+        ax3.set_xlabel('Category')
+        ax3.set_ylabel('Count')
+        canvas3 = FigureCanvasTkAgg(fig3, master=self.main_frame)
+        canvas3.draw()
+        canvas3.get_tk_widget().pack(side='left', expand=True, fill='both', padx=10, pady=10)
 
-        name_entry = tk.Entry(new_window)
-        category_entry = tk.Entry(new_window)
-        image_entry = tk.Entry(new_window)
+        fig4, ax4 = plt.subplots()
+        ax4.barh(categories, counts, color='green')
+        ax4.set_title('Horizontal Bar Chart')
+        ax4.set_xlabel('Count')
+        ax4.set_ylabel('Category')
+        canvas4 = FigureCanvasTkAgg(fig4, master=self.main_frame)
+        canvas4.draw()
+        canvas4.get_tk_widget().pack(side='left', expand=True, fill='both', padx=10, pady=10)
 
-        name_entry.grid(row=0, column=1)
-        category_entry.grid(row=1, column=1)
-        image_entry.grid(row=2, column=1)
+    def show_realtime_view(self):
+        for widget in self.main_frame.winfo_children():
+            widget.destroy()
 
-        def select_image():
-            file_path = filedialog.askopenfilename()
-            image_entry.delete(0, tk.END)
-            image_entry.insert(0, file_path)
+        self.camera_frame = tk.Label(self.main_frame, bg='#34495e')
+        self.camera_frame.pack(padx=20, pady=20, expand=True, fill='both')
+        
+        self.control_frame = tk.Frame(self.main_frame, bg='#2c3e50')
+        self.control_frame.pack(side='bottom', pady=10)
 
-        select_image_button = tk.Button(new_window, text="Browse", command=select_image)
-        select_image_button.grid(row=2, column=2)
+        self.start_button = tk.Button(self.control_frame, text="Start Camera", command=self.start_camera, bg='#27ae60', fg='white', font=("Helvetica", 10))
+        self.start_button.grid(row=0, column=0, padx=5, pady=5)
+        
+        self.stop_button = tk.Button(self.control_frame, text="Stop Camera", command=self.stop_camera, bg='#e74c3c', fg='white', font=("Helvetica", 10))
+        self.stop_button.grid(row=0, column=1, padx=5, pady=5)
 
-        def save_object():
-            name = name_entry.get()
-            category = category_entry.get()
-            image_path = image_entry.get()
+        self.start_detection_button = tk.Button(self.control_frame, text="Start Detection", command=self.start_detection, bg='#3498db', fg='white', font=("Helvetica", 10))
+        self.start_detection_button.grid(row=0, column=2, padx=5, pady=5)
 
-            # Save the image to train_images directory
-            new_image_path = os.path.join("train_images", os.path.basename(image_path))
-            if image_path != new_image_path:
-                shutil.copy(image_path, new_image_path)
+        self.stop_detection_button = tk.Button(self.control_frame, text="Stop Detection", command=self.stop_detection, bg='#e74c3c', fg='white', font=("Helvetica", 10))
+        self.stop_detection_button.grid(row=0, column=3, padx=5, pady=5)
+        
+        self.capture_button = tk.Button(self.control_frame, text="Capture & Tag", command=self.capture_image, bg='#3498db', fg='white', font=("Helvetica", 10))
+        self.capture_button.grid(row=0, column=4, padx=5, pady=5)
+        
+        self.train_button = tk.Button(self.control_frame, text="Train Model", command=self.train_model, bg='#e67e22', fg='white', font=("Helvetica", 10))
+        self.train_button.grid(row=0, column=5, padx=5, pady=5)
 
-            conn = sqlite3.connect('object_recognition.db')
-            c = conn.cursor()
-            c.execute("INSERT INTO objects (name, category, image_path) VALUES (?, ?, ?)", (name, category, new_image_path))
-            conn.commit()
-            conn.close()
+        self.switch_model_button = tk.Button(self.control_frame, text="Switch Model", command=self.switch_model, bg='#9b59b6', fg='white', font=("Helvetica", 10))
+        self.switch_model_button.grid(row=0, column=6, padx=5, pady=5)
 
-            if encoding is not None:
-                self.known_faces[name] = encoding
+        self.night_vision_button = tk.Button(self.control_frame, text="Toggle Night Vision", command=self.toggle_night_vision, bg='#2c3e50', fg='white', font=("Helvetica", 10))
+        self.night_vision_button.grid(row=0, column=7, padx=5, pady=5)
 
-            self.known_objects[name] = {
-                'category': category,
-                'image': cv2.imread(new_image_path)
-            }
+        self.ip_entry_label = tk.Label(self.control_frame, text="IP Address:", font=("Helvetica", 10), bg='#2c3e50', fg='white')
+        self.ip_entry_label.grid(row=0, column=8, padx=5, pady=5)
+        self.ip_entry = tk.Entry(self.control_frame, font=("Helvetica", 10))
+        self.ip_entry.grid(row=0, column=9, padx=5, pady=5)
+        self.ip_entry.insert(0, "192.168.1.2:8080")
 
-            messagebox.showinfo("Success", "Object entry saved successfully!")
-            new_window.destroy()
+class CustomKNNClassifier:
+    def __init__(self, k=1):
+        self.k = k
+        self.data = None
+        self.labels = None
 
-        save_button = tk.Button(new_window, text="Save", command=save_object)
-        save_button.grid(row=3, columnspan=3)
+    def fit(self, data, labels):
+        self.data = data
+        self.labels = labels
 
-    def enter_object_manually(self, image_path=None):
-        new_window = tk.Toplevel(self.master)
-        new_window.title("Enter New Object")
-
-        tk.Label(new_window, text="Object Name").grid(row=0)
-        tk.Label(new_window, text="Category").grid(row=1)
-        tk.Label(new_window, text="Image").grid(row=2)
-
-        name_entry = tk.Entry(new_window)
-        category_entry = tk.Entry(new_window)
-        image_entry = tk.Entry(new_window)
-
-        name_entry.grid(row=0, column=1)
-        category_entry.grid(row=1, column=1)
-        image_entry.grid(row=2, column=1)
-
-        if image_path:
-            image_entry.insert(0, image_path)
-
-        def select_image():
-            file_path = filedialog.askopenfilename()
-            image_entry.delete(0, tk.END)
-            image_entry.insert(0, file_path)
-
-        select_image_button = tk.Button(new_window, text="Browse", command=select_image)
-        select_image_button.grid(row=2, column=2)
-
-        def save_object():
-            name = name_entry.get()
-            category = category_entry.get()
-            image_path = image_entry.get()
-
-            # Save the image to train_images directory
-            new_image_path = os.path.join("train_images", os.path.basename(image_path))
-            if image_path != new_image_path:
-                shutil.copy(image_path, new_image_path)
-
-            conn = sqlite3.connect('object_recognition.db')
-            c = conn.cursor()
-            c.execute("INSERT INTO objects (name, category, image_path) VALUES (?, ?, ?)", (name, category, new_image_path))
-            conn.commit()
-            conn.close()
-
-            self.known_objects[name] = {
-                'category': category,
-                'image': cv2.imread(new_image_path)
-            }
-
-            messagebox.showinfo("Success", "Object entry saved successfully!")
-            new_window.destroy()
-
-        save_button = tk.Button(new_window, text="Save", command=save_object)
-        save_button.grid(row=3, columnspan=3)
+    def predict(self, data):
+        predictions = []
+        for point in data:
+            distances = np.linalg.norm(self.data - point, axis=1)
+            nearest_neighbor = np.argmin(distances)
+            predictions.append(self.labels[nearest_neighbor])
+        return predictions
 
 if __name__ == "__main__":
-    init_db()
     root = tk.Tk()
-    app = ObjectRecognitionApp(root)
+    app = MobileCameraApp(root)
     root.mainloop()
